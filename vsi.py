@@ -46,18 +46,57 @@ import matplotlib.colors as mcolors
 from collections import deque
 from typing import Optional
 
+
 # ---------------------------------------------------------------------------
-# Map parameters
+# Tunable parameters (all in one place)
 # ---------------------------------------------------------------------------
 
+# --- Grid and road layout ---
 GRID_W, GRID_H = 20, 20
-
-ROAD_HALF       = 2
-CENTER          = 10
+ROAD_HALF      = 2
+CENTER         = 10
 COL_LO, COL_HI = CENTER - ROAD_HALF, CENTER + ROAD_HALF   # 8,12 — N-S road cols
 ROW_LO, ROW_HI = CENTER - ROAD_HALF, CENTER + ROAD_HALF   # 8,12 — E-W road rows
-
 EASTBOUND_LANES = [10, 11]   # gy values for eastbound car lanes
+
+# --- MCTS and planning ---
+MCTS_ITERATIONS = 1000   # Number of MCTS rollouts per step
+EXPLORATION     = 1.7    # UCB exploration constant
+ROLLOUT_DEPTH   = 50     # Planning horizon (steps)
+ROLLOUT_GAMMA   = 0.9    # Discount factor for future rewards
+
+# --- Collision and cone ---
+CONE_DEPTH              = 3     # How far to predict scooter cone
+BPA_DEPTH               = 3     # BPA backtrack steps
+COLLISION_APPROX_BUFFER = 4     # Cells/time for cone pruning
+BPA_EPSILON             = 0.01  # BPA/collision truncation threshold
+
+# --- Rewards and penalties (TUNED for yielding behavior, iteration 4) ---
+# Hazard penalty disabled to test if car will proceed after yielding.
+GOAL_REWARD          = 100.0 # Strong reward for reaching the goal
+TIMESTEP_PENALTY     = 1.0  # Penalty per timestep
+HAZARD_SCALE         = 10.0   # Hazard penalty disabled
+LANE_PENALTY         = 10.0   # Penalty for lane change
+INTERSECTION_PENALTY = 1.0   # Low penalty for being in intersection
+JERK_PENALTY         = 1.0   # Penalty per unit of |ds|-1 (aggressive accel)
+
+# --- Car setup ---
+CAR_START  = (0, 10, 3)    # (gx=0, gy=10 inner eastbound lane, speed=2)
+GOAL_GX    = GRID_W - 1    # 19
+SPEED_MIN, SPEED_MAX = 0, 3
+
+# --- Scooter setup ---
+SCOOTER_START = (1, 11, GRID_H - 5)  # dir=N, gx=10, gy=16 (3 blocks higher)
+SCOOTER_PATH  = ([0] * 6  # 10 steps north: gy 16->6 (westbound inner row)
+               + [1]        # deterministic left turn: N->W
+               + [0] * 13)  # forward west, exits top-left
+
+# --- Car actions ---
+CAR_ACTIONS  = [(ds, dl) for ds in (-2, -1, 0, 1, 2) for dl in (-1, 0, 1)]
+
+# ---------------------------------------------------------------------------
+# Map parameters (do not tune below here)
+# ---------------------------------------------------------------------------
 
 def is_road(gx: int, gy: int) -> bool:
     on_ew = ROW_LO <= gy < ROW_HI
@@ -80,44 +119,108 @@ DIR_DELTA = {0: (1, 0), 1: (0, -1), 2: (-1, 0), 3: (0, 1)}
 def turn_left(d):  return (d + 1) % 4
 def turn_right(d): return (d - 1) % 4
 
-# ---------------------------------------------------------------------------
-# Scooter setup
-# ---------------------------------------------------------------------------
+def animate_side_by_side(
+    car_traj1, scooter_traj1, cones1,
+    car_traj2, scooter_traj2, cones2,
+    interval_ms: int = 500, save_gif: bool = True):
+    """
+    Show two simulations side by side:
+    - Left: BPA pruning (current logic)
+    - Right: No pruning (cone=None in get_children/mcts), but hazard penalties still apply
+    """
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    n_frames = min(len(car_traj1), len(car_traj2))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8), facecolor=DARK_BG)
+    ax1.set_facecolor(DARK_BG)
+    ax2.set_facecolor(DARK_BG)
+    _draw_static_map(ax1)
+    _draw_static_map(ax2)
 
-# gx=10 = second-to-right of N-S cols 8-11; gy=19 = bottom.
-# 10 north steps reach gy=9 (westbound inner row); turn is deterministic.
-SCOOTER_START = (1, 11, GRID_H - 1)  # dir=N, gx=10, gy=19
+    # --- Left (BPA pruning) ---
+    cone_patches1 = {}
+    for gx in range(GRID_W):
+        for gy in range(GRID_H):
+            if is_road(gx, gy):
+                p = plt.Rectangle((gx, gy), 1, 1, facecolor=CONE_COL, edgecolor="none", alpha=0.0, zorder=3)
+                ax1.add_patch(p)
+                cone_patches1[(gx, gy)] = p
+    car_rect1 = plt.Rectangle((0, 0), 1.0, 1.0, facecolor=CAR_COL, edgecolor="white", linewidth=1.2, zorder=6)
+    ax1.add_patch(car_rect1)
+    scooter_dot1, = ax1.plot([], [], "o", color=SCOOTER_COL, markersize=12, markeredgecolor="white", markeredgewidth=0.8, zorder=7)
+    step_text1 = ax1.text(0.02, 0.98, "", transform=ax1.transAxes, color="white", fontsize=9, va="top", ha="left", fontfamily="monospace", zorder=8)
 
-SCOOTER_PATH  = ([0] * 10  # 10 steps north: gy 19->9 (westbound inner row)
-               + [1]        # deterministic left turn: N->W
-               + [0] * 13)  # forward west, exits top-left
+    # --- Right (No pruning) ---
+    cone_patches2 = {}
+    for gx in range(GRID_W):
+        for gy in range(GRID_H):
+            if is_road(gx, gy):
+                p = plt.Rectangle((gx, gy), 1, 1, facecolor=CONE_COL, edgecolor="none", alpha=0.0, zorder=3)
+                ax2.add_patch(p)
+                cone_patches2[(gx, gy)] = p
+    car_rect2 = plt.Rectangle((0, 0), 1.0, 1.0, facecolor=CAR_COL, edgecolor="white", linewidth=1.2, zorder=6)
+    ax2.add_patch(car_rect2)
+    scooter_dot2, = ax2.plot([], [], "o", color=SCOOTER_COL, markersize=12, markeredgecolor="white", markeredgewidth=0.8, zorder=7)
+    step_text2 = ax2.text(0.02, 0.98, "", transform=ax2.transAxes, color="white", fontsize=9, va="top", ha="left", fontfamily="monospace", zorder=8)
 
-CONE_DEPTH = 5
-BPA_DEPTH    = 5     # steps back BPA traces from each top event
-COLLISION_APPROX_BUFFER = 3
-BPA_EPSILON  = 0.005  # truncation threshold
-HAZARD_SCALE = 40.0  # max negative reward for certain collision path
-LANE_PENALTY = 4.0
-HISTORY_LEN = 3 # avoid the scooter 1-3 steps ago
-# ---------------------------------------------------------------------------
-# Car setup
-# ---------------------------------------------------------------------------
+    ax1.set_title("BPA PRUNING", color="white")
+    ax2.set_title("NO PRUNING (hazard penalty only)", color="white")
 
-CAR_START  = (0, 10, 1)    # (gx=0, gy=10 inner eastbound lane, speed=1)
-GOAL_GX    = GRID_W - 1    # 19
+    def _update(frame):
+        t = frame % n_frames
+        # --- Left (BPA pruning) ---
+        car1 = car_traj1[t]
+        scooter1 = scooter_traj1[t]
+        cone1 = cones1[t]
+        for p in cone_patches1.values():
+            p.set_alpha(0.0)
+        if cone1:
+            max_p = max(v[0] for v in cone1.values()) or 1.0
+            for (cgx, cgy), (prob, _) in cone1.items():
+                if (cgx, cgy) in cone_patches1:
+                    cone_patches1[(cgx, cgy)].set_alpha(min(0.1 + 0.55 * prob / max_p, 0.72))
+        gx1, gy1, speed1 = car1
+        car_rect1.set_xy((gx1, gy1))
+        _, sx1, sy1 = scooter1
+        scooter_dot1.set_data([sx1 + 0.5], [sy1 + 0.5])
+        step_text1.set_text(f"step {t:>2d} / {len(car_traj1) - 1}\ncar   gx={gx1:>2d}  gy={gy1}  spd={speed1}\nscoot gx={sx1:>2d}  gy={sy1}")
 
-SPEED_MIN, SPEED_MAX = 0, 3
+        # --- Right (No pruning) ---
+        car2 = car_traj2[t]
+        scooter2 = scooter_traj2[t]
+        cone2 = cones2[t]
+        for p in cone_patches2.values():
+            p.set_alpha(0.0)
+        if cone2:
+            max_p = max(v[0] for v in cone2.values()) or 1.0
+            for (cgx, cgy), (prob, _) in cone2.items():
+                if (cgx, cgy) in cone_patches2:
+                    cone_patches2[(cgx, cgy)].set_alpha(min(0.1 + 0.55 * prob / max_p, 0.72))
+        gx2, gy2, speed2 = car2
+        car_rect2.set_xy((gx2, gy2))
+        _, sx2, sy2 = scooter2
+        scooter_dot2.set_data([sx2 + 0.5], [sy2 + 0.5])
+        step_text2.set_text(f"step {t:>2d} / {len(car_traj2) - 1}\ncar   gx={gx2:>2d}  gy={gy2}  spd={speed2}\nscoot gx={sx2:>2d}  gy={sy2}")
 
-# All 9 action combos: (delta_speed, delta_lane)
-# 15 actions: ds in {-2,-1,0,1,2} x dl in {-1,0,1}
-# Larger |ds| is faster but incurs jerk penalty in reward()
-CAR_ACTIONS  = [(ds, dl) for ds in (0, 1, 2) for dl in (-1, 0, 1)]
-JERK_PENALTY = 1.5   # reward penalty per unit of |ds| above 1
+        return (
+            list(cone_patches1.values()) + [car_rect1, scooter_dot1, step_text1] +
+            list(cone_patches2.values()) + [car_rect2, scooter_dot2, step_text2]
+        )
 
-MCTS_ITERATIONS = 1000   # increased: more budget to plan through intersection
-EXPLORATION     = 1.7
-ROLLOUT_DEPTH   = 40
-ROLLOUT_GAMMA   = 0.99   # less discounting so distant goal stays valuable
+    anim = FuncAnimation(
+        fig, _update,
+        frames=n_frames,
+        interval=interval_ms,
+        blit=False,
+        repeat=True,
+    )
+
+    if save_gif:
+        path = "mcts_intersection.gif"
+        anim.save(path, writer=PillowWriter(fps=max(1, 1000 // interval_ms)))
+        print(f"Saved {path}")
+
+    plt.tight_layout()
+    plt.show()
 
 # ---------------------------------------------------------------------------
 # Car movement
@@ -199,23 +302,6 @@ def build_depth_kernels(max_depth: int) -> list[dict]:
         kernels.append(current)
     kernels.append(current)
     return kernels
-
-def build_scooter_cone_with_history(
-    scooter_state: tuple, scooter_path: list, history_trail: list = None,
-    max_depth=CONE_DEPTH, min_prob=0.01
-) -> dict:
-    """Cone + scooter history trail (past positions with decay)."""
-    cone = build_scooter_cone(scooter_state, scooter_path, max_depth, min_prob)
-    
-    # Add history trail (scooter positions from t-1, t-2, t-3)
-    if history_trail:
-        for t_offset, past_state in enumerate(history_trail[-HISTORY_LEN:]):
-            _, pgx, pgy = past_state
-            decay_prob = 0.15 * (0.7 ** t_offset)  # recent=0.15, older=0.03
-            if (pgx, pgy) not in cone or cone[(pgx, pgy)][0] < decay_prob:
-                cone[(pgx, pgy)] = (decay_prob, 0)  # depth=0 for history
-    
-    return cone
 
 def build_scooter_cone(
     scooter_state: tuple,
@@ -313,7 +399,8 @@ def get_children(state: tuple, cone: dict = None, tree_depth: int = 0) -> list:
         if new_speed > SPEED_MAX or new_speed < SPEED_MIN:
             continue
 
-        if new_speed == 0 and dl != 0:
+        # Allow acceleration from speed 0, even with lane change
+        if speed == 0 and new_speed == 0 and dl != 0:
             continue
 
         new_gx = min(gx + new_speed, GRID_W - 1)
@@ -323,18 +410,64 @@ def get_children(state: tuple, cone: dict = None, tree_depth: int = 0) -> list:
 
         candidates.append((ds, dl))
 
-    # CONE PRUNING: filter candidates (no re-assignment issue)
+    # Debug: print available actions if car is stuck at (16, 10, 0)
+    # if gx == 16 and gy == 10 and speed == 0:
+        # print(f"[DEBUG] get_children at (16,10,0): candidates = {candidates}")
+
+    # CONE PRUNING: filter candidates, including intermediate states
     if cone:
         safe_actions = []
         for action in candidates:  # candidates definitely exists here
             next_state = car_apply_action(state, action)
             ngx, ngy, _ = next_state
             
-            if (ngx, ngy) in cone:
-                cone_prob, cone_depth = cone[(ngx, ngy)]
-                if abs(tree_depth - cone_depth) <= COLLISION_APPROX_BUFFER and cone_prob > BPA_EPSILON:
-                    continue  # prune: high risk at matching time
-            safe_actions.append(action)
+            is_hazardous = False
+            
+            # Check all intermediate gx values when accelerating/decelerating
+            # (moving from gx to ngx along the current lane gy)
+            # Also check adjacent lanes since scooter might be crossing
+            for intermediate_gx in range(gx + 1, ngx + 1):
+                # Check current lane and adjacent lanes
+                for check_gy in [gy - 1, gy, gy + 1]:
+                    if check_gy < 0 or check_gy >= GRID_H:
+                        continue
+                    if (intermediate_gx, check_gy) in cone:
+                        cone_prob, cone_depth = cone[(intermediate_gx, check_gy)]
+                        # Check current tree_depth and future tree_depths within buffer
+                        for check_depth in range(tree_depth, tree_depth + COLLISION_APPROX_BUFFER + 1):
+                            if abs(check_depth - cone_depth) <= COLLISION_APPROX_BUFFER and cone_prob > BPA_EPSILON:
+                                is_hazardous = True
+                                break
+                        if is_hazardous:
+                            break
+                if is_hazardous:
+                    break
+            
+            # Check all intermediate gy values when changing lanes
+            # (moving from gy to ngy along the final gx ngx)
+            # Also check adjacent gx positions
+            if not is_hazardous:
+                start_gy = min(gy, ngy)
+                end_gy = max(gy, ngy)
+                for intermediate_gy in range(start_gy, end_gy + 1):
+                    # Check current gx and adjacent gx
+                    for check_gx in [ngx - 1, ngx, ngx + 1]:
+                        if check_gx < 0 or check_gx >= GRID_W:
+                            continue
+                        if (check_gx, intermediate_gy) in cone:
+                            cone_prob, cone_depth = cone[(check_gx, intermediate_gy)]
+                            # Check current tree_depth and future tree_depths within buffer
+                            for check_depth in range(tree_depth, tree_depth + COLLISION_APPROX_BUFFER + 1):
+                                if abs(check_depth - cone_depth) <= COLLISION_APPROX_BUFFER and cone_prob > BPA_EPSILON:
+                                    is_hazardous = True
+                                    break
+                            if is_hazardous:
+                                break
+                    if is_hazardous:
+                        break
+            
+            if not is_hazardous:
+                safe_actions.append(action)
         
         # Use safe_actions if any, else fallback to original candidates
         candidates = safe_actions if safe_actions else candidates
@@ -430,9 +563,14 @@ def build_bpa_hazard_map(cone: dict) -> dict:
 # ★  HOOK 2 — Terminal
 # ---------------------------------------------------------------------------
 
-def is_terminal(state: tuple, depth: int = 0) -> bool:
+def is_terminal(state: tuple) -> bool:
     gx, gy, speed = state
-    return gx >= GOAL_GX or depth >= ROLLOUT_DEPTH
+    return gx >= GOAL_GX
+
+
+def reached_planning_horizon(depth: int, start_depth: int) -> bool:
+    """Relative horizon so each MCTS call gets the full rollout budget."""
+    return (depth - start_depth) >= ROLLOUT_DEPTH
 
 # ---------------------------------------------------------------------------
 # ★  HOOK 3 — Reward
@@ -444,38 +582,61 @@ _hazard_map: dict = {}
 
 def reward(state: tuple, next_state: tuple, depth: int = 0, cone: dict=None) -> float:
     """
-    +100 at goal.
-    +5 per cell of forward progress.
-    -1 per timestep.
-    -2 for any lane change.
-    -JERK_PENALTY * max(0, |ds|-1)  for |ds| > 1 (aggressive speed change).
-    -HAZARD_SCALE * bpa_prob  (BPA penalty proportional to collision prob).
+    +1.0 at goal (GOAL_REWARD).
+    -1.0 per timestep (TIMESTEP_PENALTY cost for waiting).
+    All other penalties are disabled (0).
+    """
+    gx,  gy,  spd    = state
+    ngx, ngy, nspeed = next_state
+    
+    if ngx >= GOAL_GX:
+        return GOAL_REWARD
+    lane_penalty = -LANE_PENALTY if ngy != gy else 0.0
+    in_intersection = COL_LO <= ngx < COL_HI and ROW_LO <= ngy < ROW_HI
+    intersection_penalty = -INTERSECTION_PENALTY if in_intersection else 0.0
+    ds = abs(nspeed - spd)
+    jerk_penalty = -JERK_PENALTY * max(0, ds - 1)
+
+    return (
+        -TIMESTEP_PENALTY
+        + lane_penalty
+        + intersection_penalty
+        + jerk_penalty
+    )
+
+# Module-level: reward_no_bpa for use in animate
+def reward_no_bpa(state: tuple, next_state: tuple, depth: int = 0, cone: dict=None) -> float:
+    """
+    Same as reward(), but ignores hazard penalties (hazard_pen and scooter_cutoff_penalty).
     """
     gx,  gy,  spd    = state
     ngx, ngy, nspeed = next_state
     if ngx >= GOAL_GX:
-        return 100.0
-    progress     = (ngx - gx) * 5.0
+        return GOAL_REWARD
     lane_penalty = -LANE_PENALTY if ngy != gy else 0.0
+    in_intersection = COL_LO <= ngx < COL_HI and ROW_LO <= ngy < ROW_HI
+    intersection_penalty = -INTERSECTION_PENALTY if in_intersection else 0.0
     ds           = abs(nspeed - spd)
-    ds = abs(nspeed - spd)
     jerk_penalty = -JERK_PENALTY * max(0, ds - 1)
-    hazard_prob  = _hazard_map.get((ngx, ngy, nspeed, depth), 0.0)
-    hazard_pen   = -HAZARD_SCALE * hazard_prob
+    hazard_prob = _hazard_map.get((ngx, ngy, nspeed, depth), 0.0)
+    hazard_pen = -HAZARD_SCALE * hazard_prob
 
     scooter_cutoff_penalty = 0.0
     if cone:
         for (cx, cy), (cprob, cdepth) in cone.items():
-            # Distance penalty (stronger if close in time)
             dist = abs(cx - ngx) + abs(cy - ngy)
             time_diff = abs(cdepth - depth)
-            
-            # Penalty if within 2 cells AND similar time horizon
             if dist <= COLLISION_APPROX_BUFFER and time_diff <= COLLISION_APPROX_BUFFER:
                 risk = cprob * (3.0 - dist) * (1.0 / (1 + time_diff))
                 scooter_cutoff_penalty -= HAZARD_SCALE * risk
 
-    return -1.0 + progress + lane_penalty + jerk_penalty + hazard_pen + scooter_cutoff_penalty
+    return (
+        -TIMESTEP_PENALTY
+        + lane_penalty
+        + intersection_penalty
+        + hazard_pen
+        + jerk_penalty
+    )
 
 # ---------------------------------------------------------------------------
 # ★  HOOK 4 — Rollout
@@ -487,7 +648,7 @@ def rollout(state: tuple, cone: dict, start_depth: int) -> float:
     discount = 1.0
     rollout_depth = start_depth
     for _ in range(ROLLOUT_DEPTH):
-        if is_terminal(current, rollout_depth):
+        if is_terminal(current):
             break
         # PASS cone + incrementing depth to match tree!
         actions = get_children(current, cone=cone, tree_depth=rollout_depth)
@@ -498,7 +659,7 @@ def rollout(state: tuple, cone: dict, start_depth: int) -> float:
         total += discount * reward(current, next_state, rollout_depth, cone)
         discount *= ROLLOUT_GAMMA
         current = next_state
-        start_depth += 1  # advance rollout depth
+        rollout_depth += 1  # advance rollout depth
     return total
 
 def _rollout_policy(state: tuple, actions: list) -> tuple:
@@ -547,13 +708,17 @@ class Node:
         return max(self.children, key=lambda n: n.ucb1(c))
 
 
-def _select(node, c, cone):
-    while node.is_fully_expanded() and not is_terminal(node.state, node.depth):
+def _select(node, c, cone, root_depth):
+    while (
+        node.is_fully_expanded()
+        and not is_terminal(node.state)
+        and not reached_planning_horizon(node.depth, root_depth)
+    ):
         node = node.best_child(c)
     return node
 
-def _expand(node, cone):
-    if is_terminal(node.state, node.depth):
+def _expand(node, cone, root_depth):
+    if is_terminal(node.state) or reached_planning_horizon(node.depth, root_depth):
         return node
     tried   = {ch.action for ch in node.children}
     untried = [a for a in get_children(node.state, cone, node.depth) if a not in tried]
@@ -561,7 +726,7 @@ def _expand(node, cone):
         return node
     action    = untried[0]
     new_state = car_apply_action(node.state, action)
-    child     = Node(new_state, parent=node, action=action)
+    child     = Node(new_state, parent=node, action=action, depth=node.depth + 1)
     node.children.append(child)
     return child
 
@@ -573,21 +738,27 @@ def _backprop(node, r):
 
 def mcts(root_state: tuple, cone: dict = None, tree_depth: int = 0,
          num_iter: int = MCTS_ITERATIONS, c: float = EXPLORATION) -> tuple:
-    root = Node(root_state, depth=0)
-    for _ in range(num_iter):
-        leaf  = _select(root, c, cone)
-        child = _expand(leaf, cone)
-        r     = rollout(child.state, cone, child.depth)
+    root = Node(root_state, depth=tree_depth)
+    for i in range(num_iter):
+        leaf  = _select(root, c, cone, root.depth)
+        child = _expand(leaf, cone, root.depth)
+        # Include immediate transition reward + discounted rollout reward
+        transition_r = reward(leaf.state, child.state, leaf.depth, cone)
+        rollout_r = rollout(child.state, cone, child.depth)
+        r = transition_r + ROLLOUT_GAMMA * rollout_r
         _backprop(child, r)
+    
     if not root.children:
         return (0, 0)
+
+    # Choose the action with the highest Q-value
     return max(root.children, key=lambda n: n.q).action
 
 # ---------------------------------------------------------------------------
 # Simulation  (records per-step cones for animation)
 # ---------------------------------------------------------------------------
 
-def simulate(max_steps: int = 40) -> tuple:
+def simulate(max_steps: int = 40, prune: bool = True) -> tuple:
     """
     Returns
     -------
@@ -601,14 +772,10 @@ def simulate(max_steps: int = 40) -> tuple:
     scooter_traj  = [scooter_state]
     cones         = []
 
-    # Track scooter history for history avoidance
-    scooter_history = deque(maxlen=HISTORY_LEN + 1)
-    scooter_history.append(scooter_state)
-
     for step in range(max_steps):
         remaining = SCOOTER_PATH[step:] if step < len(SCOOTER_PATH) else [0]
-        cone = build_scooter_cone_with_history(
-            scooter_state, remaining, list(scooter_history)
+        cone = build_scooter_cone(
+            scooter_state, remaining
         )
         cones.append(cone)
 
@@ -616,6 +783,7 @@ def simulate(max_steps: int = 40) -> tuple:
         global _hazard_map
         _hazard_map = build_bpa_hazard_map(cone)
 
+        # print(f"[DEBUG] simulate: step={step}, car_state={car_state}")
         if is_terminal(car_state):
             print(f"  Goal reached at step {step}!")
             break
@@ -625,8 +793,6 @@ def simulate(max_steps: int = 40) -> tuple:
 
         sc_intended = SCOOTER_PATH[step] if step < len(SCOOTER_PATH) else 0
         sc_next     = scooter_sample(scooter_state, sc_intended)
-
-        scooter_history.append(sc_next)
 
         ds, dl = car_action
         print(f"  Step {step:3d} | "
@@ -638,6 +804,7 @@ def simulate(max_steps: int = 40) -> tuple:
 
         car_state     = car_next
         scooter_state = sc_next
+        # print(f"[DEBUG] after action: step={step}, car_state={car_state}, car_action={car_action}")
         car_traj.append(car_state)
         scooter_traj.append(scooter_state)
 
@@ -725,8 +892,9 @@ def animate(car_traj: list, scooter_traj: list, cones: list,
 
     n_frames = len(car_traj)
 
-    fig, ax = plt.subplots(figsize=(9, 9), facecolor=DARK_BG)
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(15, 8), facecolor=DARK_BG, gridspec_kw={'width_ratios': [2, 1]})
     ax.set_facecolor(DARK_BG)
+    ax2.set_facecolor(DARK_BG)
     _draw_static_map(ax)
 
     # Pre-create one Rectangle per road cell for the cone overlay.
@@ -806,13 +974,57 @@ def animate(car_traj: list, scooter_traj: list, cones: list,
             f"car   gx={gx:>2d}  gy={gy}  spd={speed}\n"
             f"scoот gx={sx:>2d}  gy={sy}")
 
+        # -- Action reward comparison (bar chart) ----------------------------
+        ax2.clear()
+        ax2.set_facecolor(DARK_BG)
+        ax2.set_title("Action Rewards: With vs. Without BPA", color="white")
+        ax2.set_ylabel("Immediate Reward", color="white")
+        ax2.tick_params(axis='x', colors='white')
+        ax2.tick_params(axis='y', colors='white')
+        ax2.spines['bottom'].set_color('white')
+        ax2.spines['top'].set_color('white')
+        ax2.spines['right'].set_color('white')
+        ax2.spines['left'].set_color('white')
+
+        # Compute available actions and rewards with BPA
+        actions_bpa = get_children(car, cone=cone, tree_depth=t)
+        rewards_bpa = []
+        for action in actions_bpa:
+            next_state = car_apply_action(car, action)
+            r = reward(car, next_state, t, cone)
+            rewards_bpa.append((action, r))
+
+        # Compute available actions and rewards without BPA (cone=None, reward_no_bpa)
+        actions_no_bpa = get_children(car, cone=None, tree_depth=t)
+        rewards_no_bpa = []
+        for action in actions_no_bpa:
+            next_state = car_apply_action(car, action)
+            r = reward_no_bpa(car, next_state, t, cone)
+            rewards_no_bpa.append((action, r))
+
+        # Union of all actions for x-axis
+        all_actions = sorted(set([a for a, _ in rewards_bpa] + [a for a, _ in rewards_no_bpa]))
+        x = range(len(all_actions))
+        bpa_vals = [dict(rewards_bpa).get(a, float('nan')) for a in all_actions]
+        no_bpa_vals = [dict(rewards_no_bpa).get(a, float('nan')) for a in all_actions]
+
+        bar_width = 0.4
+        ax2.bar([i - bar_width/2 for i in x], bpa_vals, width=bar_width, label='With BPA', color='#e53935', alpha=0.7)
+        ax2.bar([i + bar_width/2 for i in x], no_bpa_vals, width=bar_width, label='No BPA', color='#43a047', alpha=0.7)
+        ax2.set_xticks(list(x))
+        ax2.set_xticklabels([str(a) for a in all_actions], rotation=45, ha='right', color='white', fontsize=8)
+        ax2.legend(facecolor=DARK_BG, edgecolor='white', fontsize=8)
+        ax2.grid(True, axis='y', color='#444', alpha=0.3)
+
         return list(cone_patches.values()) + [car_rect, scooter_dot, step_text]
 
+
+    # Blitting does not work well with multiple axes/subplots (esp. bar charts)
     anim = FuncAnimation(
         fig, _update,
         frames=n_frames,
         interval=interval_ms,
-        blit=True,
+        blit=False,  # Disable blitting for subplot compatibility
         repeat=True,
     )
 
@@ -835,18 +1047,22 @@ if __name__ == "__main__":
     print(f"Grid      : {GRID_W}×{GRID_H}  (gy=0=top, gy=19=bottom)")
     print(f"E-W road  : rows {ROW_LO}–{ROW_HI-1}  |  N-S road: cols {COL_LO}–{COL_HI-1}")
     print(f"Car start : gx={CAR_START[0]}, gy={CAR_START[1]}, speed={CAR_START[2]}"
-          f"  →  goal gx={GOAL_GX}")
+        f"  →  goal gx={GOAL_GX}")
     print(f"Scooter   : dir=N, gx={SCOOTER_START[1]}, gy={SCOOTER_START[2]} (bottom)"
-          f"  →  turns W at intersection\n")
+        f"  →  turns W at intersection\n")
 
-    init_cone = build_scooter_cone(SCOOTER_START, SCOOTER_PATH)
+    print("Simulating with BPA pruning (left)...")
+    car_traj1, scooter_traj1, cones1 = simulate(max_steps=40, prune=True)
+    print("Simulating without pruning (right)...")
+    car_traj2, scooter_traj2, cones2 = simulate(max_steps=40, prune=False)
 
-    car_traj, scooter_traj, cones = simulate(max_steps=40)
+    final1 = car_traj1[-1]
+    final2 = car_traj2[-1]
+    print(f"\nLEFT (BPA pruning): Car steps    : {len(car_traj1)}")
+    print(f"LEFT (BPA pruning): Car final    : gx={final1[0]}, gy={final1[1]}, speed={final1[2]}")
+    print(f"LEFT (BPA pruning): Goal reached : {final1[0] >= GOAL_GX}")
+    print(f"\nRIGHT (No pruning): Car steps    : {len(car_traj2)}")
+    print(f"RIGHT (No pruning): Car final    : gx={final2[0]}, gy={final2[1]}, speed={final2[2]}")
+    print(f"RIGHT (No pruning): Goal reached : {final2[0] >= GOAL_GX}")
 
-    final = car_traj[-1]
-    print(f"\nCar steps    : {len(car_traj)}")
-    print(f"Car final    : gx={final[0]}, gy={final[1]}, speed={final[2]}")
-    print(f"Goal reached : {final[0] >= GOAL_GX}")
-
-    # interval_ms controls playback speed; save_gif=True writes mcts_intersection.gif
-    animate(car_traj, scooter_traj, cones, interval_ms=500, save_gif=True)
+    animate_side_by_side(car_traj1, scooter_traj1, cones1, car_traj2, scooter_traj2, cones2, interval_ms=500, save_gif=True)
