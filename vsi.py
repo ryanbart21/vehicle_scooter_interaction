@@ -22,29 +22,31 @@ Agents
              gy    : 10 or 11  (lane change allowed)
              speed : 0–3 blocks advanced per timestep
            Actions = all combos of:
-             acceleration : -1, 0, +1  (clamped to [0, 3])
+                         acceleration : -2, -1, 0, +1, +2  (clamped to [0, 3])
              lane change  : -1, 0, +1  (gy ± 1, clamped to eastbound lanes)
-           → 9 actions total (3 accel × 3 lane)
+                     → 15 actions total (5 accel × 3 lane)
 
-  Scooter : South → West (fixed path, unknown to car).
+    Scooter : South → West (fixed path, unknown to car).
              Starts gy=19 (bottom), drives north in northbound lane (gx=9),
              turns left (West) at intersection, exits westward (gy=11).
-             Stochastic transitions: may veer or fail to turn.
+                         Transitions are deterministic along SCOOTER_PATH.
 
 MCTS
 ----
   Car knows the scooter's CURRENT position (visible) but not its future path.
   The cone { (gx,gy): (probability, depth) } encodes the predicted future.
   Cone pruning goes in get_children() — implement your threshold logic there.
+
+Robustness test
+---------------
+    The default run is deterministic.
+    A separate robustness mode samples scooter deviations from the kernel.
 """
 
 import math
 import random
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import matplotlib.colors as mcolors
-from collections import deque
-from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -72,27 +74,35 @@ COLLISION_APPROX_BUFFER = 4     # Cells/time for cone pruning
 BPA_EPSILON             = 0.01  # BPA/collision truncation threshold
 
 # --- Rewards and penalties (TUNED for yielding behavior, iteration 4) ---
-# Hazard penalty disabled to test if car will proceed after yielding.
 GOAL_REWARD          = 100.0 # Strong reward for reaching the goal
 TIMESTEP_PENALTY     = 1.0  # Penalty per timestep
-HAZARD_SCALES        = [10.0, 50.0, 100.0]   # Used for no-prune hazard-only scenarios
+HAZARD_SCALES        = [10.0, 50.0, 100.0]   # No-prune hazard-only scenarios
 LANE_PENALTY         = 5.0   # Penalty for lane change
 INTERSECTION_PENALTY = 2.0   # Low penalty for being in intersection
 JERK_PENALTY         = 5.0   # Penalty per unit of |ds|-1 (aggressive accel)
 
 # --- Car setup ---
-CAR_START  = (0, 10, 3)    # (gx=0, gy=10 inner eastbound lane, speed=2)
+CAR_START  = (0, 10, 3)    # (gx=0, gy=10 inner eastbound lane, speed=3)
 GOAL_GX    = GRID_W - 1    # 19
 SPEED_MIN, SPEED_MAX = 0, 3
 
 # --- Scooter setup ---
-SCOOTER_START = (1, 11, GRID_H - 5)  # dir=N, gx=10, gy=16 (3 blocks higher)
-SCOOTER_PATH  = ([0] * 7  # 10 steps north: gy 16->6 (westbound inner row)
-               + [1]        # deterministic left turn: N->W
+SCOOTER_START = (1, 11, GRID_H - 5)  # dir=N, gx=11, gy=15
+SCOOTER_PATH  = ([0] * 7  # turn time = count of leading straight steps
+               + [1]       # left turn: N->W
                + [0] * 13)  # forward west, exits top-left
 
 # --- Car actions ---
 CAR_ACTIONS  = [(ds, dl) for ds in (-2, -1, 0, 1, 2) for dl in (-1, 0, 1)]
+
+# --- Scooter transition kernel ---
+SCOOTER_TRANSITION_KERNEL = {
+    (0, -1): 0.125,
+    (-1, 0): 0.125,
+    (0, 0): 0.5,
+    (1, 0): 0.125,
+    (0, 1): 0.125,
+}
 
 # ---------------------------------------------------------------------------
 # Map parameters (do not tune below here)
@@ -120,29 +130,68 @@ def turn_left(d):  return (d + 1) % 4
 def turn_right(d): return (d - 1) % 4
 
 
+def _rotate_local(dx: int, dy: int, facing: int) -> tuple[int, int]:
+    if facing == 0:
+        return dx, dy
+    if facing == 1:
+        return dy, -dx
+    if facing == 2:
+        return -dx, -dy
+    if facing == 3:
+        return -dy, dx
+    return dx, dy
+
+
+def _sample_kernel_offset(rng: random.Random, kernel: dict) -> tuple[int, int]:
+    total = sum(kernel.values())
+    draw = rng.random() * total
+    cumulative = 0.0
+    last_offset = (0, 0)
+    for offset, weight in kernel.items():
+        last_offset = offset
+        cumulative += weight
+        if draw <= cumulative:
+            return offset
+    return last_offset
+
+
+def _rotate_local(dx: int, dy: int, facing: int) -> tuple[int, int]:
+    if facing == 0:
+        return dx, dy
+    if facing == 1:
+        return dy, -dx
+    if facing == 2:
+        return -dx, -dy
+    if facing == 3:
+        return -dy, dx
+    return dx, dy
+
+
 def _path_cells(start_gx: int, start_gy: int, end_gx: int, end_gy: int) -> set[tuple[int, int]]:
     """Approximate within-step occupied cells for an agent transition."""
     cells: set[tuple[int, int]] = {(start_gx, start_gy)}
 
-    gx = start_gx
-    gy = start_gy
+    if end_gx != start_gx:
+        step_x = 1 if end_gx > start_gx else -1
+        for x in range(start_gx + step_x, end_gx + step_x, step_x):
+            cells.add((x, start_gy))
 
-    if end_gx != gx:
-        step_x = 1 if end_gx > gx else -1
-        for x in range(gx + step_x, end_gx + step_x, step_x):
-            cells.add((x, gy))
-
-    if end_gy != gy:
-        step_y = 1 if end_gy > gy else -1
-        for y in range(gy + step_y, end_gy + step_y, step_y):
+    if end_gy != start_gy:
+        step_y = 1 if end_gy > start_gy else -1
+        for y in range(start_gy + step_y, end_gy + step_y, step_y):
             cells.add((end_gx, y))
 
     return cells
 
 
+def _first_goal_step(car_traj: list) -> int | None:
+    """Return first index where the car reaches goal, or None."""
+    return next((i for i, st in enumerate(car_traj) if is_terminal(st)), None)
+
+
 def _scenario_outcome(car_traj: list, scooter_traj: list) -> dict:
     """Classify scenario outcome for post-goal overlay color."""
-    goal_step = next((i for i, st in enumerate(car_traj) if is_terminal(st)), None)
+    goal_step = _first_goal_step(car_traj)
 
     eval_end = goal_step if goal_step is not None else (len(car_traj) - 1)
     lane_change = any(
@@ -150,15 +199,16 @@ def _scenario_outcome(car_traj: list, scooter_traj: list) -> dict:
         for i in range(1, eval_end + 1)
     )
 
-    stopped_at_intersection = any(
+    stopped_far_from_intersection = any(
         (st[2] == 0)
         and (st[1] in EASTBOUND_LANES)
-        and (COL_LO - 1 <= st[0] < COL_HI)
+        and not (COL_LO - 2 <= st[0] < COL_HI + 2)
         for st in car_traj[:eval_end + 1]
     )
 
     collision_or_cross = False
     cut_in_front_close = False
+    cut_in_front = False
     horizon = min(eval_end, len(scooter_traj) - 1)
     for i in range(1, horizon + 1):
         c0 = car_traj[i - 1]
@@ -185,9 +235,14 @@ def _scenario_outcome(car_traj: list, scooter_traj: list) -> dict:
                 rel_y = cgy - sgy
                 forward_gap = rel_x * fdx + rel_y * fdy
                 lateral_gap = abs(rel_x * fdy - rel_y * fdx)
-                if 1 <= forward_gap <= 2 and lateral_gap <= 1:
+                # Only treat this as a cut-in-front case when the scooter is
+                # crossing the car's eastbound heading at right angles.
+                headings_perpendicular = (fdx == 0)
+                if headings_perpendicular and 0 == forward_gap and lateral_gap <= 1:
                     cut_in_front_close = True
                     break
+                elif headings_perpendicular and 1 <= forward_gap and lateral_gap <= 1:
+                    cut_in_front = True
             if cut_in_front_close:
                 break
         if cut_in_front_close:
@@ -195,10 +250,10 @@ def _scenario_outcome(car_traj: list, scooter_traj: list) -> dict:
 
     if collision_or_cross or cut_in_front_close:
         color = "#d32f2f"  # red
-    elif stopped_at_intersection and not lane_change:
-        color = "#2e7d32"  # green
-    else:
+    elif stopped_far_from_intersection or lane_change or cut_in_front:
         color = "#f9a825"  # yellow
+    else:
+        color = "#2e7d32"  # green
 
     return {
         "goal_step": goal_step,
@@ -210,10 +265,10 @@ def animate_four_way(
     interval_ms: int = 500,
     save_gif: bool = True,
 ):
-    """Show four simulations in a 2x2 layout."""
+    """Show four simulations in a 2x2 layout, or three with one empty panel."""
     from matplotlib.animation import FuncAnimation, PillowWriter
-    if len(scenarios) != 4:
-        raise ValueError("animate_four_way expects exactly 4 scenarios")
+    if len(scenarios) not in (3, 4):
+        raise ValueError("animate_four_way expects 3 or 4 scenarios")
 
     n_frames = min(len(s["car"]) for s in scenarios)
     fig, axes = plt.subplots(2, 2, figsize=(16, 12), facecolor=DARK_BG)
@@ -268,6 +323,9 @@ def animate_four_way(
         ax.set_title(s["title"], color="white")
         artists.append((s, outcome, cone_patches, car_rect, scooter_dot, step_text, overlay_rect, overlay_text))
 
+    for ax in axes[len(scenarios):]:
+        ax.axis("off")
+
     def _update(frame):
         t = frame % n_frames
         updated = []
@@ -316,7 +374,7 @@ def animate_four_way(
     )
 
     if save_gif:
-        path = "mcts_intersection_4up.gif"
+        path = "mcts_intersection_4up.gif" if len(scenarios) == 4 else "mcts_intersection_robustness_3up.gif"
         anim.save(path, writer=PillowWriter(fps=max(1, 1000 // interval_ms)))
         print(f"Saved {path}")
 
@@ -366,8 +424,28 @@ def _sc_apply(state: tuple, action: int) -> tuple:
     return (new_dir, ngx, ngy)
 
 def scooter_sample(state: tuple, intended: int) -> tuple:
-    """Deterministic: scooter always executes SCOOTER_PATH exactly."""
+    """Deterministic scooter transition."""
     return _sc_apply(state, intended)
+
+
+def scooter_sample_stochastic(state: tuple, intended: int, rng: random.Random) -> tuple:
+    """Sample straight-step scooter deviation from the transition kernel."""
+    if intended != 0:
+        return _sc_apply(state, intended)
+
+    direction, gx, gy = state
+    dx, dy = DIR_DELTA[direction]
+    ahead_x, ahead_y = gx + dx, gy + dy
+
+    if rng.random() < 0.2:
+        offset_x, offset_y = _sample_kernel_offset(rng, SCOOTER_TRANSITION_KERNEL)
+    else:
+        offset_x = 0; offset_y = 0
+    dev_x, dev_y = _rotate_local(offset_x, offset_y, direction)
+    ngx, ngy = ahead_x + dev_x, ahead_y + dev_y
+    if not is_valid(ngx, ngy):
+        ngx, ngy = gx, gy
+    return (direction, ngx, ngy)
 
 # ---------------------------------------------------------------------------
 # Scooter cone
@@ -392,13 +470,7 @@ def build_depth_kernels(max_depth: int) -> list[dict]:
     kernels[d] = K convolved with itself d times.
     """
     # Base 3x3 kernel centred at (0,0)
-    base = {
-        (0, -1): 0.125,
-        (-1, 0): 0.125,
-        (0, 0):  0.5,
-        (1, 0):  0.125,
-        (0, 1):  0.125,
-    }
+    base = SCOOTER_TRANSITION_KERNEL
     kernels = [None]  # index 0 unused
     current = base
     for d in range(1, max_depth + 1):
@@ -907,7 +979,13 @@ def mcts(root_state: tuple, prune_cone: dict = None, reward_cone: dict = None, t
 # Simulation  (records per-step cones for animation)
 # ---------------------------------------------------------------------------
 
-def simulate(max_steps: int = 40, prune: bool = True, hazard_scale: float = 10.0) -> tuple:
+def simulate(
+    max_steps: int = 40,
+    prune: bool = True,
+    hazard_scale: float = 10.0,
+    stochastic_scooter: bool = False,
+    rng_seed: int | None = None,
+) -> tuple:
     """
     Returns
     -------
@@ -917,6 +995,7 @@ def simulate(max_steps: int = 40, prune: bool = True, hazard_scale: float = 10.0
     """
     global _active_hazard_scale
     _active_hazard_scale = hazard_scale
+    rng = random.Random(rng_seed) if rng_seed is not None else random
 
     car_state     = CAR_START
     scooter_state = SCOOTER_START
@@ -972,7 +1051,10 @@ def simulate(max_steps: int = 40, prune: bool = True, hazard_scale: float = 10.0
             sc_next = scooter_state
         else:
             sc_intended = SCOOTER_PATH[step] if step < len(SCOOTER_PATH) else 0
-            sc_next = scooter_sample(scooter_state, sc_intended)
+            if stochastic_scooter:
+                sc_next = scooter_sample_stochastic(scooter_state, sc_intended, rng)
+            else:
+                sc_next = scooter_sample(scooter_state, sc_intended)
 
         ds, dl = car_action
         print(f"  Step {step:3d} | "
@@ -1254,10 +1336,38 @@ if __name__ == "__main__":
 
     for s in scenarios:
         final = s["car"][-1]
-        goal_step = next((i for i, st in enumerate(s["car"]) if is_terminal(st)), None)
+        goal_step = _first_goal_step(s["car"])
         car_steps = goal_step if goal_step is not None else (len(s["car"]) - 1)
         print(f"\n{s['title']}: Car steps    : {car_steps}")
         print(f"{s['title']}: Car final    : gx={final[0]}, gy={final[1]}, speed={final[2]}")
         print(f"{s['title']}: Goal reached : {final[0] >= GOAL_GX}")
 
     animate_four_way(scenarios, interval_ms=500, save_gif=True)
+
+    print("\nRunning scooter robustness test with stochastic deviations...")
+    robustness_scenarios = []
+    for run_idx, seed in enumerate((111, 222, 333, 444), start=1):
+        print(f"Simulating robustness run {run_idx} (seed={seed})...")
+        car_traj, scooter_traj, cones = simulate(
+            max_steps=40,
+            prune=True,
+            hazard_scale=0.0,
+            stochastic_scooter=True,
+            rng_seed=seed,
+        )
+        robustness_scenarios.append({
+            "title": f"ROBUSTNESS RUN {run_idx} (seed={seed})",
+            "car": car_traj,
+            "scooter": scooter_traj,
+            "cones": cones,
+        })
+
+    for s in robustness_scenarios:
+        final = s["car"][-1]
+        goal_step = _first_goal_step(s["car"])
+        car_steps = goal_step if goal_step is not None else (len(s["car"]) - 1)
+        print(f"\n{s['title']}: Car steps    : {car_steps}")
+        print(f"{s['title']}: Car final    : gx={final[0]}, gy={final[1]}, speed={final[2]}")
+        print(f"{s['title']}: Goal reached : {final[0] >= GOAL_GX}")
+
+    animate_four_way(robustness_scenarios, interval_ms=500, save_gif=True)
