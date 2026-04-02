@@ -16,18 +16,18 @@ Road layout (drive-on-right)
 
 Agents
 ------
-  Car    : West → East, eastbound lane (gy=10 or 11).
-           State = (gx, gy, speed)
+    Car     : West → East, eastbound lane (gy=10 or 11).
+             State = (gx, gy, speed)
              gx    : 0–19
              gy    : 10 or 11  (lane change allowed)
              speed : 0–3 blocks advanced per timestep
-           Actions = all combos of:
-                         acceleration : -2, -1, 0, +1, +2  (clamped to [0, 3])
+             Actions = all combos of:
+                         acceleration : -2, -1, 0, +1, +2  (clamped to [0, 3] speed)
              lane change  : -1, 0, +1  (gy ± 1, clamped to eastbound lanes)
-                     → 15 actions total (5 accel × 3 lane)
+                         → 15 actions total (5 accel × 3 lane)
 
     Scooter : South → West (fixed path, unknown to car).
-             Starts gy=19 (bottom), drives north in northbound lane (gx=9),
+             Starts gy=15 (near bottom), drives north in northbound lane (gx=9),
              turns left (West) at intersection, exits westward (gy=11).
                          Transitions are deterministic along SCOOTER_PATH.
 
@@ -35,7 +35,6 @@ MCTS
 ----
   Car knows the scooter's CURRENT position (visible) but not its future path.
   The cone { (gx,gy): (probability, depth) } encodes the predicted future.
-  Cone pruning goes in get_children() — implement your threshold logic there.
 
 Robustness test
 ---------------
@@ -47,6 +46,16 @@ import math
 import random
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
+from matplotlib.animation import FuncAnimation, PillowWriter
+from collections import defaultdict, deque
+from enum import IntEnum
+
+class Direction(IntEnum):
+    EAST = 0
+    NORTH = 1
+    WEST = 2
+    SOUTH = 3
 
 # ---------------------------------------------------------------------------
 # Tunable parameters (all in one place)
@@ -86,7 +95,7 @@ GOAL_GX    = GRID_W - 1    # 19
 SPEED_MIN, SPEED_MAX = 0, 3
 
 # --- Scooter setup ---
-SCOOTER_START = (1, 11, GRID_H - 5)  # dir=N, gx=11, gy=15
+SCOOTER_START = (Direction.NORTH, 11, GRID_H - 5)  # dir=N, gx=11, gy=15
 SCOOTER_PATH  = ([0] * 7  # turn time = count of leading straight steps
                + [1]       # left turn: N->W
                + [0] * 13)  # forward west, exits top-left
@@ -105,8 +114,9 @@ SCOOTER_TRANSITION_KERNEL = {
 
 # --- Robustness study ---
 ROBUSTNESS_RUN_COUNT = 30
-ROBUSTNESS_ANIMATED_RUNS = 4
+ROBUSTNESS_ANIMATED_RUNS = 4 # Only animates the BPA pruning runs
 ROBUSTNESS_HAZARD_SCALE = 50.0
+STOCHASTIC_PERCENTAGE = 0.25
 
 # ---------------------------------------------------------------------------
 # Map parameters (do not tune below here)
@@ -128,10 +138,19 @@ def is_valid(gx: int, gy: int) -> bool:
 # gy=0 is TOP so North = gy decreases, South = gy increases
 # ---------------------------------------------------------------------------
 
-DIR_DELTA = {0: (1, 0), 1: (0, -1), 2: (-1, 0), 3: (0, 1)}
+DIR_DELTA = {
+    Direction.EAST: (1, 0),
+    Direction.NORTH: (0, -1),
+    Direction.WEST: (-1, 0),
+    Direction.SOUTH: (0, 1),
+}
 
-def turn_left(d):  return (d + 1) % 4
-def turn_right(d): return (d - 1) % 4
+def turn_left(d):
+    return Direction((Direction(d).value + 1) % 4)
+
+
+def turn_right(d):
+    return Direction((Direction(d).value - 1) % 4)
 
 
 def _sample_kernel_offset(rng: random.Random, kernel: dict) -> tuple[int, int]:
@@ -147,14 +166,14 @@ def _sample_kernel_offset(rng: random.Random, kernel: dict) -> tuple[int, int]:
     return last_offset
 
 
-def _rotate_local(dx: int, dy: int, facing: int) -> tuple[int, int]:
-    if facing == 0:
+def _rotate_local(dx: int, dy: int, facing: Direction) -> tuple[int, int]:
+    if facing == Direction.EAST:
         return dx, dy
-    if facing == 1:
+    if facing == Direction.NORTH:
         return dy, -dx
-    if facing == 2:
+    if facing == Direction.WEST:
         return -dx, -dy
-    if facing == 3:
+    if facing == Direction.SOUTH:
         return -dy, dx
     return dx, dy
 
@@ -258,7 +277,6 @@ def animate_four_way(
     save_gif: bool = True,
 ):
     """Show four simulations in a 2x2 layout, or three with one empty panel."""
-    from matplotlib.animation import FuncAnimation, PillowWriter
     if len(scenarios) not in (3, 4):
         raise ValueError("animate_four_way expects 3 or 4 scenarios")
 
@@ -634,6 +652,7 @@ def car_apply_action(state: tuple, action: tuple) -> tuple:
 
 def _sc_apply(state: tuple, action: int) -> tuple:
     direction, gx, gy = state
+    direction = Direction(direction)
     if   action == 0: new_dir = direction
     elif action == 1: new_dir = turn_left(direction)
     elif action == 2: new_dir = turn_right(direction)
@@ -655,10 +674,11 @@ def scooter_sample_stochastic(state: tuple, intended: int, rng: random.Random) -
         return _sc_apply(state, intended)
 
     direction, gx, gy = state
+    direction = Direction(direction)
     dx, dy = DIR_DELTA[direction]
     ahead_x, ahead_y = gx + dx, gy + dy
 
-    if rng.random() < 0.25:
+    if rng.random() < STOCHASTIC_PERCENTAGE:
         offset_x, offset_y = _sample_kernel_offset(rng, SCOOTER_TRANSITION_KERNEL)
     else:
         offset_x = 0; offset_y = 0
@@ -671,8 +691,6 @@ def scooter_sample_stochastic(state: tuple, intended: int, rng: random.Random) -
 # ---------------------------------------------------------------------------
 # Scooter cone
 # ---------------------------------------------------------------------------
-
-from collections import defaultdict
 
 def convolve_kernels(k1: dict, k2: dict) -> dict:
     """
@@ -717,6 +735,7 @@ def build_scooter_cone(
 
     for d in range(1, max_depth + 1):
         facing, gx, gy = state
+        facing = Direction(facing)
 
         # One step ahead of scooter at this depth
         adx, ady = DIR_DELTA[facing]
@@ -743,7 +762,7 @@ def build_scooter_cone(
                 state = _sc_apply(state, intended)
             continue
 
-        # Renormalise this depth slice
+        # Renormalize this depth slice
         total_mass = sum(depth_probs.values())
         for (nx, ny), w in depth_probs.items():
             prob = w / total_mass
@@ -764,9 +783,6 @@ def build_scooter_cone(
 
     return cone
 
-# ---------------------------------------------------------------------------
-# ★  HOOK 1 — get_children  (add your cone pruning here)
-# ---------------------------------------------------------------------------
 
 def get_children(state: tuple, cone: dict = None, tree_depth: int = 0) -> list:
     """
@@ -775,7 +791,6 @@ def get_children(state: tuple, cone: dict = None, tree_depth: int = 0) -> list:
     gx, gy, speed = state
     candidates = []
 
-    # Existing candidate filtering (unchanged)
     for ds, dl in CAR_ACTIONS:
         new_speed = max(SPEED_MIN, min(SPEED_MAX, speed + ds))
         new_gy    = gy + dl
@@ -901,7 +916,6 @@ def build_bpa_hazard_map(cone: dict) -> dict:
 
     Returns { (gx, gy, speed, tree_depth) : hazard_probability in [0,1] }
     """
-    from collections import deque
     hazard_map: dict = {}
 
     def _record(state, depth, prob):
@@ -942,10 +956,6 @@ def build_bpa_hazard_map(cone: dict) -> dict:
     return hazard_map
 
 
-# ---------------------------------------------------------------------------
-# ★  HOOK 2 — Terminal
-# ---------------------------------------------------------------------------
-
 def is_terminal(state: tuple) -> bool:
     gx, gy, speed = state
     return gx >= GOAL_GX
@@ -954,16 +964,13 @@ def is_terminal(state: tuple) -> bool:
 def is_scooter_terminal(state: tuple) -> bool:
     """Scooter is considered done once it reaches the west map edge heading west."""
     direction, gx, gy = state
-    return direction == 2 and gx == 0
+    return Direction(direction) == Direction.WEST and gx == 0
 
 
 def reached_planning_horizon(depth: int, start_depth: int) -> bool:
     """Relative horizon so each MCTS call gets the full rollout budget."""
     return (depth - start_depth) >= ROLLOUT_DEPTH
 
-# ---------------------------------------------------------------------------
-# ★  HOOK 3 — Reward
-# ---------------------------------------------------------------------------
 
 # Module-level hazard map — updated each simulation step
 _hazard_map: dict = {}
@@ -1065,10 +1072,6 @@ def reward_no_bpa(state: tuple, next_state: tuple, depth: int = 0, cone: dict=No
         + jerk_penalty
     )
 
-# ---------------------------------------------------------------------------
-# ★  HOOK 4 — Rollout
-# ---------------------------------------------------------------------------
-
 def rollout(state: tuple, prune_cone: dict, reward_cone: dict, start_depth: int, reward_fn) -> float:
     current  = state
     total    = 0.0
@@ -1077,7 +1080,7 @@ def rollout(state: tuple, prune_cone: dict, reward_cone: dict, start_depth: int,
     for _ in range(ROLLOUT_DEPTH):
         if is_terminal(current):
             break
-        # PASS cone + incrementing depth to match tree!
+        # Pass cone and incrementing depth to match tree
         actions = get_children(current, cone=prune_cone, tree_depth=rollout_depth)
         if not actions:  # safety
             break
@@ -1092,7 +1095,7 @@ def rollout(state: tuple, prune_cone: dict, reward_cone: dict, start_depth: int,
 def _rollout_policy(state: tuple, actions: list) -> tuple:
     """Always push forward: prefer accel with no lane change.
     Fall back to any forward action, then any action.
-    Never change lanes during rollout (avoids the -2 penalty).
+    Avoid changing lanes during rollout (avoids the -2 penalty).
     """
     # 1st choice: accelerate straight
     accel_straight = [(ds, dl) for ds, dl in actions if ds > 0 and dl == 0]
@@ -1225,10 +1228,10 @@ def simulate(
         car_done = is_terminal(car_state)
         scooter_done = is_scooter_terminal(scooter_state)
         if car_done and not car_goal_logged:
-            print(f"  Car reached goal at step {step}!")
+            print(f"  Car reached goal at step {step}.")
             car_goal_logged = True
         if car_done and scooter_done:
-            print(f"  Both vehicles reached goal at step {step}!")
+            print(f"  Both vehicles reached goal at step {step}.")
             break
 
         if car_done:
@@ -1290,9 +1293,9 @@ OFFROAD_COL = "#010409"
 GRID_LINE   = "#30363d"
 LANE_LINE   = "#6e7681"
 GOAL_COL    = "#3fb950"
-CAR_COL     = "#e53935"    # red rectangle
-SCOOTER_COL = "#43a047"    # green dot
-CONE_COL    = "#ffb300"    # amber cone
+CAR_COL     = "#e53935"    # red rectangle (car)
+SCOOTER_COL = "#43a047"    # green dot (scooter)
+CONE_COL    = "#ffb300"    # amber cone (predicted future scooter states)
 
 
 def _draw_static_map(ax):
@@ -1354,8 +1357,6 @@ def animate(car_traj: list, scooter_traj: list, cones: list,
     • Green circle       — scooter
     • HUD                — step, car speed, positions
     """
-    from matplotlib.animation import FuncAnimation, PillowWriter
-    import matplotlib.lines as mlines
 
     n_frames = len(car_traj)
 
