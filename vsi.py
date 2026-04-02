@@ -48,7 +48,6 @@ import random
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-
 # ---------------------------------------------------------------------------
 # Tunable parameters (all in one place)
 # ---------------------------------------------------------------------------
@@ -69,7 +68,7 @@ ROLLOUT_GAMMA   = 0.9    # Discount factor for future rewards
 
 # --- Collision and cone ---
 CONE_DEPTH              = 3     # How far to predict scooter cone
-BPA_DEPTH               = 3     # BPA backtrack steps
+BPA_DEPTH               = 5     # BPA backtrack steps
 COLLISION_APPROX_BUFFER = 4     # Cells/time for cone pruning
 BPA_EPSILON             = 0.01  # BPA/collision truncation threshold
 
@@ -104,6 +103,11 @@ SCOOTER_TRANSITION_KERNEL = {
     (0, 1): 0.125,
 }
 
+# --- Robustness study ---
+ROBUSTNESS_RUN_COUNT = 30
+ROBUSTNESS_ANIMATED_RUNS = 4
+ROBUSTNESS_HAZARD_SCALE = 50.0
+
 # ---------------------------------------------------------------------------
 # Map parameters (do not tune below here)
 # ---------------------------------------------------------------------------
@@ -128,18 +132,6 @@ DIR_DELTA = {0: (1, 0), 1: (0, -1), 2: (-1, 0), 3: (0, 1)}
 
 def turn_left(d):  return (d + 1) % 4
 def turn_right(d): return (d - 1) % 4
-
-
-def _rotate_local(dx: int, dy: int, facing: int) -> tuple[int, int]:
-    if facing == 0:
-        return dx, dy
-    if facing == 1:
-        return dy, -dx
-    if facing == 2:
-        return -dx, -dy
-    if facing == 3:
-        return -dy, dx
-    return dx, dy
 
 
 def _sample_kernel_offset(rng: random.Random, kernel: dict) -> tuple[int, int]:
@@ -374,11 +366,240 @@ def animate_four_way(
     )
 
     if save_gif:
-        path = "mcts_intersection_4up.gif" if len(scenarios) == 4 else "mcts_intersection_robustness_3up.gif"
+        path = (
+            "mcts_intersection_robustness.gif"
+            if any(s["title"].startswith("ROBUSTNESS") for s in scenarios)
+            else "mcts_pruning_comparison.gif"
+        )
         anim.save(path, writer=PillowWriter(fps=max(1, 1000 // interval_ms)))
         print(f"Saved {path}")
 
     plt.tight_layout()
+    plt.show()
+
+
+def plot_robustness_histogram(scenarios: list, save_png: bool = True):
+    """Plot steps-to-goal counts by outcome color using grouped bars."""
+    if not scenarios:
+        return
+
+    red_steps = []
+    yellow_steps = []
+    green_steps = []
+
+    for s in scenarios:
+        outcome = _scenario_outcome(s["car"], s["scooter"])
+        goal_step = outcome["goal_step"]
+        steps = goal_step if goal_step is not None else (len(s["car"]) - 1)
+
+        if outcome["color"] == "#d32f2f":
+            red_steps.append(steps)
+        elif outcome["color"] == "#f9a825":
+            yellow_steps.append(steps)
+        else:
+            green_steps.append(steps)
+
+    all_steps = red_steps + yellow_steps + green_steps
+    if not all_steps:
+        return
+
+    total_runs = len(all_steps)
+    min_step = min(all_steps)
+    max_step = max(all_steps)
+    step_values = list(range(min_step, max_step + 1))
+
+    red_counts = [red_steps.count(step) for step in step_values]
+    yellow_counts = [yellow_steps.count(step) for step in step_values]
+    green_counts = [green_steps.count(step) for step in step_values]
+
+    red_pct = (100.0 * len(red_steps) / total_runs)
+    yellow_pct = (100.0 * len(yellow_steps) / total_runs)
+    green_pct = (100.0 * len(green_steps) / total_runs)
+
+    fig, ax = plt.subplots(figsize=(12, 6), facecolor=DARK_BG)
+    ax.set_facecolor(DARK_BG)
+
+    bar_w = 0.22
+    x = step_values
+    red_x = [v - bar_w for v in x]
+    yellow_x = x
+    green_x = [v + bar_w for v in x]
+
+    ax.bar(red_x, red_counts, width=bar_w, color="#d32f2f", edgecolor=GRID_LINE,
+           label=f"Red ({red_pct:.1f}%)")
+    ax.bar(yellow_x, yellow_counts, width=bar_w, color="#f9a825", edgecolor=GRID_LINE,
+           label=f"Yellow ({yellow_pct:.1f}%)")
+    ax.bar(green_x, green_counts, width=bar_w, color="#2e7d32", edgecolor=GRID_LINE,
+           label=f"Green ({green_pct:.1f}%)")
+
+    ax.set_title("Robustness: Steps To Goal (30 Runs)", color="white")
+    ax.set_xlabel("Car steps to goal", color="white")
+    ax.set_ylabel("Run count", color="white")
+    ax.set_xticks(step_values)
+    ax.set_xticklabels([str(v) for v in step_values], color="white")
+
+    max_count = max(red_counts + yellow_counts + green_counts)
+    if max_count <= 1:
+        y_ticks = [0, 1]
+    else:
+        y_step = 2
+        y_top = max_count if (max_count % y_step == 0) else (max_count + (y_step - (max_count % y_step)))
+        y_ticks = list(range(0, y_top + y_step, y_step))
+    ax.set_yticks(y_ticks)
+    ax.set_ylim(0, y_ticks[-1])
+
+    ax.tick_params(axis="x", colors="white")
+    ax.tick_params(axis="y", colors="white")
+    ax.spines["bottom"].set_color("white")
+    ax.spines["top"].set_color("white")
+    ax.spines["right"].set_color("white")
+    ax.spines["left"].set_color("white")
+    ax.grid(True, axis="y", color="#444", alpha=0.3)
+    ax.legend(facecolor=DARK_BG, edgecolor="white", labelcolor="white")
+
+    # Per-color percentage summary in-plot for quick readability.
+    ax.text(
+        0.99,
+        0.98,
+        f"Red: {red_pct:.1f}%   Yellow: {yellow_pct:.1f}%   Green: {green_pct:.1f}%",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        color="white",
+        fontsize=10,
+        bbox=dict(facecolor="#161b22", edgecolor=GRID_LINE, alpha=0.8, boxstyle="round,pad=0.3"),
+    )
+
+    plt.tight_layout()
+    if save_png:
+        path = "robustness_steps_histogram.png"
+        fig.savefig(path, dpi=150)
+        print(f"Saved {path}")
+    plt.show()
+
+
+def _steps_by_outcome_color(scenarios: list) -> tuple[list, list, list]:
+    red_steps = []
+    yellow_steps = []
+    green_steps = []
+
+    for s in scenarios:
+        outcome = _scenario_outcome(s["car"], s["scooter"])
+        goal_step = outcome["goal_step"]
+        steps = goal_step if goal_step is not None else (len(s["car"]) - 1)
+
+        if outcome["color"] == "#d32f2f":
+            red_steps.append(steps)
+        elif outcome["color"] == "#f9a825":
+            yellow_steps.append(steps)
+        else:
+            green_steps.append(steps)
+
+    return red_steps, yellow_steps, green_steps
+
+
+def _style_hist_axis(ax, step_values: list, red_counts: list, yellow_counts: list, green_counts: list):
+    ax.set_xticks(step_values)
+    ax.set_xticklabels([str(v) for v in step_values], color="white")
+
+    max_count = max(red_counts + yellow_counts + green_counts) if step_values else 0
+    if max_count <= 1:
+        y_ticks = [0, 1]
+    else:
+        y_step = 2
+        y_top = max_count if (max_count % y_step == 0) else (max_count + (y_step - (max_count % y_step)))
+        y_ticks = list(range(0, y_top + y_step, y_step))
+
+    ax.set_yticks(y_ticks)
+    ax.set_ylim(0, y_ticks[-1])
+    ax.tick_params(axis="x", colors="white")
+    ax.tick_params(axis="y", colors="white")
+    ax.spines["bottom"].set_color("white")
+    ax.spines["top"].set_color("white")
+    ax.spines["right"].set_color("white")
+    ax.spines["left"].set_color("white")
+    ax.grid(True, axis="y", color="#444", alpha=0.3)
+
+
+def _plot_grouped_outcome_bars(ax, scenarios: list, title: str, step_values: list):
+    red_steps, yellow_steps, green_steps = _steps_by_outcome_color(scenarios)
+    total_runs = len(red_steps) + len(yellow_steps) + len(green_steps)
+
+    red_counts = [red_steps.count(step) for step in step_values]
+    yellow_counts = [yellow_steps.count(step) for step in step_values]
+    green_counts = [green_steps.count(step) for step in step_values]
+
+    red_pct = (100.0 * len(red_steps) / total_runs) if total_runs else 0.0
+    yellow_pct = (100.0 * len(yellow_steps) / total_runs) if total_runs else 0.0
+    green_pct = (100.0 * len(green_steps) / total_runs) if total_runs else 0.0
+
+    bar_w = 0.22
+    red_x = [v - bar_w for v in step_values]
+    yellow_x = step_values
+    green_x = [v + bar_w for v in step_values]
+
+    ax.bar(red_x, red_counts, width=bar_w, color="#d32f2f", edgecolor=GRID_LINE,
+           label=f"Red ({red_pct:.1f}%)")
+    ax.bar(yellow_x, yellow_counts, width=bar_w, color="#f9a825", edgecolor=GRID_LINE,
+           label=f"Yellow ({yellow_pct:.1f}%)")
+    ax.bar(green_x, green_counts, width=bar_w, color="#2e7d32", edgecolor=GRID_LINE,
+           label=f"Green ({green_pct:.1f}%)")
+
+    ax.set_facecolor(DARK_BG)
+    ax.set_title(title, color="white")
+    ax.set_ylabel("Run count", color="white")
+    _style_hist_axis(ax, step_values, red_counts, yellow_counts, green_counts)
+    ax.legend(facecolor=DARK_BG, edgecolor="white", labelcolor="white", loc="upper right")
+
+
+def plot_robustness_comparison_histograms(
+    bpa_scenarios: list,
+    hazard_scenarios: list,
+    hazard_scale: float,
+    save_png: bool = True,
+):
+    """Plot BPA-pruned and hazard-model robustness histograms in one figure."""
+    if not bpa_scenarios or not hazard_scenarios:
+        return
+
+    bpa_all = sum(_steps_by_outcome_color(bpa_scenarios), [])
+    haz_all = sum(_steps_by_outcome_color(hazard_scenarios), [])
+    all_steps = bpa_all + haz_all
+    if not all_steps:
+        return
+
+    min_step = min(all_steps)
+    max_step = max(all_steps)
+    step_values = list(range(min_step, max_step + 1))
+
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        figsize=(12, 10),
+        sharex=True,
+        facecolor=DARK_BG,
+    )
+
+    _plot_grouped_outcome_bars(
+        ax_top,
+        bpa_scenarios,
+        f"BPA-Pruned Robustness: Steps To Goal ({len(bpa_scenarios)} Runs)",
+        step_values,
+    )
+    _plot_grouped_outcome_bars(
+        ax_bottom,
+        hazard_scenarios,
+        f"Hazard Model Robustness (penalty={hazard_scale}): Steps To Goal ({len(hazard_scenarios)} Runs)",
+        step_values,
+    )
+
+    ax_bottom.set_xlabel("Car steps to goal", color="white")
+
+    plt.tight_layout()
+    if save_png:
+        path = "robustness_steps_histogram_comparison.png"
+        fig.savefig(path, dpi=150)
+        print(f"Saved {path}")
     plt.show()
 
 # ---------------------------------------------------------------------------
@@ -437,7 +658,7 @@ def scooter_sample_stochastic(state: tuple, intended: int, rng: random.Random) -
     dx, dy = DIR_DELTA[direction]
     ahead_x, ahead_y = gx + dx, gy + dy
 
-    if rng.random() < 0.2:
+    if rng.random() < 0.25:
         offset_x, offset_y = _sample_kernel_offset(rng, SCOOTER_TRANSITION_KERNEL)
     else:
         offset_x = 0; offset_y = 0
@@ -493,17 +714,6 @@ def build_scooter_cone(
     depth_kernels = build_depth_kernels(max_depth)
     cone: dict = {}
     state = scooter_state
-
-    def _rotate_local(dx: int, dy: int, facing: int) -> tuple[int, int]:
-        if facing == 0:   # up
-            return dx, dy
-        elif facing == 1: # right
-            return dy, -dx
-        elif facing == 2: # down
-            return -dx, -dy
-        elif facing == 3: # left
-            return -dy, dx
-        return dx, dy
 
     for d in range(1, max_depth + 1):
         facing, gx, gy = state
@@ -586,10 +796,6 @@ def get_children(state: tuple, cone: dict = None, tree_depth: int = 0) -> list:
             continue
 
         candidates.append((ds, dl))
-
-    # Debug: print available actions if car is stuck at (16, 10, 0)
-    # if gx == 16 and gy == 10 and speed == 0:
-        # print(f"[DEBUG] get_children at (16,10,0): candidates = {candidates}")
 
     # CONE PRUNING: filter candidates, including intermediate states
     if cone:
@@ -1066,7 +1272,6 @@ def simulate(
 
         car_state     = car_next
         scooter_state = sc_next
-        # print(f"[DEBUG] after action: step={step}, car_state={car_state}, car_action={car_action}")
         car_traj.append(car_state)
         scooter_traj.append(scooter_state)
 
@@ -1222,8 +1427,6 @@ def animate(car_traj: list, scooter_traj: list, cones: list,
 
         # -- Car rectangle: width grows with speed ---------------------------
         gx, gy, speed = car
-        w = max(0.6, min(speed + 0.8, 3.6))
-        h = 0.55
         car_rect.set_xy((gx, gy))
 
         # -- Scooter dot -----------------------------------------------------
@@ -1344,9 +1547,10 @@ if __name__ == "__main__":
 
     animate_four_way(scenarios, interval_ms=500, save_gif=True)
 
-    print("\nRunning scooter robustness test with stochastic deviations...")
+    print("\nRunning scooter robustness test with stochastic deviations (BPA-pruned)...")
     robustness_scenarios = []
-    for run_idx, seed in enumerate((111, 222, 333, 444), start=1):
+    robustness_seeds = [111 * i for i in range(1, ROBUSTNESS_RUN_COUNT + 1)]
+    for run_idx, seed in enumerate(robustness_seeds, start=1):
         print(f"Simulating robustness run {run_idx} (seed={seed})...")
         car_traj, scooter_traj, cones = simulate(
             max_steps=40,
@@ -1370,4 +1574,40 @@ if __name__ == "__main__":
         print(f"{s['title']}: Car final    : gx={final[0]}, gy={final[1]}, speed={final[2]}")
         print(f"{s['title']}: Goal reached : {final[0] >= GOAL_GX}")
 
-    animate_four_way(robustness_scenarios, interval_ms=500, save_gif=True)
+    print(f"\nRunning hazard-model robustness test (penalty={ROBUSTNESS_HAZARD_SCALE})...")
+    hazard_robustness_scenarios = []
+    for run_idx, seed in enumerate(robustness_seeds, start=1):
+        print(f"Simulating hazard robustness run {run_idx} (seed={seed})...")
+        car_traj, scooter_traj, cones = simulate(
+            max_steps=40,
+            prune=False,
+            hazard_scale=ROBUSTNESS_HAZARD_SCALE,
+            stochastic_scooter=True,
+            rng_seed=seed,
+        )
+        hazard_robustness_scenarios.append({
+            "title": f"HAZARD {ROBUSTNESS_HAZARD_SCALE} RUN {run_idx} (seed={seed})",
+            "car": car_traj,
+            "scooter": scooter_traj,
+            "cones": cones,
+        })
+
+    for s in hazard_robustness_scenarios:
+        final = s["car"][-1]
+        goal_step = _first_goal_step(s["car"])
+        car_steps = goal_step if goal_step is not None else (len(s["car"]) - 1)
+        print(f"\n{s['title']}: Car steps    : {car_steps}")
+        print(f"{s['title']}: Car final    : gx={final[0]}, gy={final[1]}, speed={final[2]}")
+        print(f"{s['title']}: Goal reached : {final[0] >= GOAL_GX}")
+
+    animate_four_way(
+        robustness_scenarios[:ROBUSTNESS_ANIMATED_RUNS],
+        interval_ms=500,
+        save_gif=True,
+    )
+    plot_robustness_comparison_histograms(
+        robustness_scenarios,
+        hazard_robustness_scenarios,
+        hazard_scale=ROBUSTNESS_HAZARD_SCALE,
+        save_png=True,
+    )
