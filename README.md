@@ -18,4 +18,5 @@ It can be seen that the BPA pruning model is significantly better than the hazar
 I believe the pruning method is advantageous over the penalty method because we can tune a parameter for a time/distance buffer from the scooter state and generally have a guarantee that no collision will occur. Collisions may occur if the scooter crosses the median and all future states are pruned for the car. Hazard penalties, on the other hand, require more relative tuning to other parameters and does not have the explainable guarantees that BPA pruning offers.
 
 ## Disclaimer
-I used Github Copilot as a productivity aid in developing my code.
+I used Github Copilot as a productivity aid in developing my code.  
+Inspired by the work of Zhitong He et al., "Risk Analysis in Vehicle and Electric Scooter Interaction".
