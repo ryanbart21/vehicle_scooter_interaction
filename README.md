@@ -20,3 +20,42 @@ I believe the pruning method is advantageous over the penalty method because we 
 ## Disclaimer
 I used Github Copilot as a productivity aid in developing my code.  
 Inspired by the work of Zhitong He et al., "Risk Analysis in Vehicle and Electric Scooter Interaction".
+
+---------------------------------------
+## Elevator Pitch Revisions
+### First Pitch
+The growing popularity of e-scooters has created a critical safety challenge in mixedtraffic environments, due to the vulnerability and low visibility of riders. My project will explore
+real-time decision-making for autonomous vehicles interacting with e-scooters, using a
+combination of a Backtracking Process Algorithm (BPA) and Monte Carlo Tree Search (MCTS),
+inspired by “Risk Analysis in Vehicle and Electric Scooter Interaction.”
+The role of the BPA is to prune state-action pairs that could lead to collisions, effectively
+reducing the search space and avoiding dangerous trajectories. The remaining state-action pairs
+will be evaluated using MCTS to select the optimal maneuver, including continuing forward
+motion, turning, or slowing down. The e-scooter trajectory will be modeled as a dynamic,
+directional cone, updated at each time step as the rider changes direction. Rewards will prioritize
+shorter, smoother trajectories, prioritizing passenger comfort while ensuring safety.
+
+### Critique Comments
+• It seems like you're doing this in a continuous state space, but maybe clarify that.
+• I assume you don't have access to a full car autonomy stack or database to test with, so what
+kind of assumptions are you making in simulating this problem? How will you keep the
+scope manageable for a class project?
+• Scooter detection is critical but noisy. Are you going to assume perfect
+detection/classification in your simulation?
+
+### Second Pitch
+The growing popularity of e-scooters has created a critical safety challenge in mixedtraffic environments, due to the vulnerability and low visibility of riders. My project will explore
+real-time decision-making for autonomous vehicles interacting with e-scooters, using a
+combination of a Backtracking Process Algorithm (BPA) and Monte Carlo Tree Search (MCTS),
+inspired by “Risk Analysis in Vehicle and Electric Scooter Interaction.”
+The role of the BPA is to prune state-action pairs that could lead to collisions, effectively
+reducing the search space and avoiding dangerous trajectories. The remaining state-action pairs
+will be evaluated using MCTS to select the optimal maneuver in discrete space and time,
+including continuing forward motion, turning, or remaining in the same state. This combination
+will reduce the search space and eliminate potentially hazardous states in advance. Rewards will
+prioritize shorter, straighter trajectories, prioritizing passenger comfort while ensuring safety.
+The e-scooter trajectory will be modeled as a dynamic, directional cone of hex cell states,
+updated at each time step as the rider changes pose. The e-scooter yaw and position will be
+modeled as completely observable, without any measurement noise. I will assume that the car
+has a limited turning radius, moves at a speed of one hex cell per time step, and can slow to a
+stop within a hex cell state.
